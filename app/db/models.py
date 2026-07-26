@@ -188,3 +188,16 @@ class FreePassReservation(Base):
     access_id: Mapped[int|None]=mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime, default=datetime.utcnow)
     __table_args__=(UniqueConstraint('user_id','session_key', name='uq_free_pass_user_session'),)
+
+class VideoFingerprint(Base):
+    __tablename__ = 'video_fingerprints'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    file_id: Mapped[str] = mapped_column(Text, default='')
+    fingerprint: Mapped[str] = mapped_column(Text)
+    duration: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    banned: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (Index('ix_video_fingerprint_banned_duration', 'banned', 'duration'),)
