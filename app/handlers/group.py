@@ -7,6 +7,7 @@ from app.services.actions import trusted_command
 from app.services.crowdfunding import handle_crowd_proof, handle_crowd_text
 from app.services.invites import on_join
 from app.services.moderation import moderate_message
+from app.services.hashban import remember_media_message
 from app.services.state import track
 from app.services.users import upsert_user
 from app.services.vip import copy_media_to_vip, handle_vip_proof
@@ -50,6 +51,9 @@ async def member_update(event: ChatMemberUpdated, bot: Bot):
 
 @router.message()
 async def all_messages(msg: Message, bot: Bot):
+    # Mémorise les éléments d’album dès leur arrivée pour /pedo et /hashdemande.
+    remember_media_message(msg)
+
     if msg.from_user:
         await upsert_user(msg.from_user)
 

@@ -17,7 +17,15 @@ from app.db.models import WordRule
 from app.services.justice import justice_preview_text, execute_justice, candidate_count
 import asyncio
 from aiogram.exceptions import TelegramBadRequest
-from app.services.hashban import ban_hash_from_message, banned_hash_count, hashban_health_text
+from app.services.hashban import (
+    audit_hashes,
+    ban_hash_from_message,
+    banned_hash_count,
+    format_hash_audit,
+    hashban_health_text,
+    remember_media_message,
+    split_telegram_text,
+)
 from app.services.freepass import free_pass_admin_kb, free_pass_admin_kb_async, admin_text as freepass_admin_text, publish_free_pass, beneficiaries_text as freepass_beneficiaries_text, reset_current_session as freepass_reset_current, reserve_free_pass, refresh_free_pass_message, is_locked as freepass_is_locked, in_admin_config_window as freepass_window_open, delete_free_pass_campaign
 from app.services.broadcast import register_private_start, supported_broadcast_message, broadcast_to_main_group, broadcast_to_private_starters, private_subscriber_count
 router=Router()
@@ -104,7 +112,7 @@ async def admin_cb(cb:CallbackQuery, bot:Bot):
     elif d=='adm_pardon_mute':
         b,r=await count_known_bans_and_restrictions(); await cb.message.answer(f'⚖️ Grâce ministérielle\n\nRestrictions connues concernées : {r}\n\nConfirmer la levée des restrictions ?',reply_markup=confirm_kb('pardon_mute'))
     elif d=='adm_reports': await cb.message.answer('📊 Les rapports sont envoyés automatiquement à chaque fermeture, avec actions trusted et inactifs.',reply_markup=back_kb())
-    elif d=='adm_hashban': await cb.message.answer('🚫 Hash ban\n\nEnvoie un média en privé pour l’ajouter aux hashes bannis.',reply_markup=hashban_kb())
+    elif d=='adm_hashban': await cb.message.answer('🚫 Hash ban\n\nEnvoie un média en privé pour le blacklister. Le bot affichera ensuite le file_unique_id, le SHA256 et leur statut.\n\nPour un album, chaque élément reçu est contrôlé.',reply_markup=hashban_kb())
     elif d=='adm_broadcast_group':
         await set_admin_state(cb.from_user.id, 'broadcast_group')
         await cb.message.answer('📢 Broadcast groupe principal\n\nEnvoie maintenant :\n• un texte\n• une photo\n• une photo avec légende\n\nLe message sera publié immédiatement dans le groupe principal.')
@@ -545,10 +553,32 @@ async def admin_text_state(msg:Message, bot:Bot):
         await st.set_value('free_pass_min_invites',str(n))
         await msg.answer(await freepass_admin_text(), reply_markup=await free_pass_admin_kb_async())
     elif state=='hash_ban_media':
+        remember_media_message(msg)
         n=await ban_hash_from_message(msg, bot)
-        if n: await msg.answer(f'✅ Hash ban ajouté : {n} média(s).', reply_markup=hashban_kb())
+        if n:
+            entries=await audit_hashes(bot, msg)
+            report=format_hash_audit(entries, title=f'✅ HASH BAN AJOUTÉ — {n} empreinte(s) enregistrée(s)')
+            chunks=split_telegram_text(report)
+            for index, chunk in enumerate(chunks):
+                await msg.answer(chunk, reply_markup=hashban_kb() if index == len(chunks)-1 else None)
         else:
             await msg.answer('Envoie une photo/vidéo/document à bannir par hash.')
+            return
+
+        # Un album arrive sous forme de plusieurs updates. On garde brièvement
+        # l’état actif pour que chaque élément soit reçu, hashé et vérifié.
+        if msg.media_group_id:
+            token=str(msg.media_group_id)
+            await st.set_value(f'hashban_album_token:{msg.from_user.id}', token)
+
+            async def clear_album_state_later(user_id:int, expected_token:str):
+                await asyncio.sleep(3)
+                current=await st.get_value(f'hashban_album_token:{user_id}', '')
+                if current==expected_token:
+                    await clear_admin_state(user_id)
+                    await st.set_value(f'hashban_album_token:{user_id}', '')
+
+            asyncio.create_task(clear_album_state_later(msg.from_user.id, token))
             return
     await clear_admin_state(msg.from_user.id)
 
