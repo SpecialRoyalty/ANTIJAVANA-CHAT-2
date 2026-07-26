@@ -5,7 +5,12 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.models import TrackedMessage, TrustedAction
 from app.db.session import SessionLocal
-from app.services.hashban import ban_hash_from_message
+from app.services.hashban import (
+    audit_hashes,
+    ban_hash_from_message,
+    format_hash_audit,
+    split_telegram_text,
+)
 from app.services.moderation import ban, delete, restrict
 from app.services.state import log_error
 
@@ -15,7 +20,7 @@ async def trusted_command(bot: Bot, msg: Message) -> bool:
         return False
 
     cmd = (msg.text or "").split()[0].lower()
-    if cmd not in ["/supprime", "/mineur", "/pasfr", "/pedo", "/clean", "/info"]:
+    if cmd not in ["/supprime", "/mineur", "/pasfr", "/pedo", "/hashdemande", "/clean", "/info"]:
         return False
 
     try:
@@ -54,6 +59,20 @@ async def trusted_command(bot: Bot, msg: Message) -> bool:
             f"@{target.from_user.username or 'sans username'}\n"
             "ID interne masqué dans le groupe.",
         )
+        return True
+
+    if cmd == "/hashdemande":
+        if not target:
+            await bot.send_message(msg.from_user.id, "Réponds à un média ou à un élément d’album avec /hashdemande.")
+            return True
+        entries = await audit_hashes(bot, target)
+        report = format_hash_audit(entries, title="🔍 DEMANDE DE VÉRIFICATION HASH")
+        for admin_id in get_settings().admin_ids:
+            for chunk in split_telegram_text(report):
+                try:
+                    await bot.send_message(admin_id, chunk)
+                except Exception as exc:
+                    await log_error("hashdemande_send", exc)
         return True
 
     if not target:

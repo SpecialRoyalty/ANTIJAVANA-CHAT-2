@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -13,12 +14,32 @@ from app.db.session import SessionLocal
 from app.services.state import log_error
 
 
+# Cache mémoire des albums reçus. Telegram envoie chaque élément d'un album comme
+# un Message séparé et ne fournit pas d'API pour relire les autres éléments.
+# Ce cache permet donc à /pedo et /hashdemande, lorsqu'ils répondent à un élément,
+# de traiter tout l'album tant que le processus n'a pas redémarré.
+_ALBUM_CACHE: dict[tuple[int, str], list[Message]] = {}
+_ALBUM_CACHE_AT: dict[tuple[int, str], float] = {}
+_ALBUM_TTL_SECONDS = 6 * 60 * 60
+
+
 @dataclass(slots=True)
 class HashBanMatch:
     matched: bool = False
     method: str = "none"  # file_unique_id | sha256 | none
     key: str | None = None
     media_type: str | None = None
+
+
+@dataclass(slots=True)
+class HashAuditEntry:
+    media_type: str
+    file_unique_id: str
+    sha256: str | None
+    id_present: bool
+    id_banned: bool
+    sha_present: bool
+    sha_banned: bool
 
 
 def media_file_entries(msg: Message) -> list[tuple[str, str, str]]:
@@ -39,6 +60,34 @@ def media_file_entries(msg: Message) -> list[tuple[str, str, str]]:
     if msg.video_note:
         return [(msg.video_note.file_unique_id, msg.video_note.file_id, "video_note")]
     return []
+
+
+def remember_media_message(msg: Message) -> None:
+    """Mémorise un élément d'album afin de pouvoir auditer/bannir l'album complet."""
+    if not msg.media_group_id or not media_file_entries(msg):
+        return
+    now = time.monotonic()
+    expired = [key for key, stored_at in _ALBUM_CACHE_AT.items() if now - stored_at > _ALBUM_TTL_SECONDS]
+    for key in expired:
+        _ALBUM_CACHE.pop(key, None)
+        _ALBUM_CACHE_AT.pop(key, None)
+
+    key = (msg.chat.id, str(msg.media_group_id))
+    items = _ALBUM_CACHE.setdefault(key, [])
+    if all(existing.message_id != msg.message_id for existing in items):
+        items.append(msg)
+        items.sort(key=lambda item: item.message_id)
+    _ALBUM_CACHE_AT[key] = now
+
+
+def related_media_messages(msg: Message) -> list[Message]:
+    """Retourne tout l'album connu, sinon seulement le message ciblé."""
+    remember_media_message(msg)
+    if not msg.media_group_id:
+        return [msg] if media_file_entries(msg) else []
+    key = (msg.chat.id, str(msg.media_group_id))
+    items = _ALBUM_CACHE.get(key, [])
+    return list(items) if items else ([msg] if media_file_entries(msg) else [])
 
 
 async def file_sha256(bot: Bot, file_id: str) -> str | None:
@@ -86,7 +135,7 @@ async def _upsert_hash(
 
 
 async def store_message_hashes(msg: Message, bot: Bot, *, banned: bool = False) -> int:
-    """Enregistre file_unique_id ET SHA256 pour chaque média du message."""
+    """Enregistre file_unique_id ET SHA256 pour le média du message."""
     entries = media_file_entries(msg)
     if not entries:
         return 0
@@ -121,27 +170,125 @@ async def store_message_hashes(msg: Message, bot: Bot, *, banned: bool = False) 
 
 
 async def ban_hash_from_message(msg: Message, bot: Bot | None = None) -> int:
-    """Blacklist le média par ID Telegram et, si possible, par SHA256."""
-    entries = media_file_entries(msg)
-    if not entries:
+    """Blacklist le média ou tout son album par ID Telegram et par SHA256."""
+    messages = related_media_messages(msg)
+    if not messages:
         return 0
 
     if bot is not None:
-        return await store_message_hashes(msg, bot, banned=True)
+        count = 0
+        for media_message in messages:
+            count += await store_message_hashes(media_message, bot, banned=True)
+        return count
 
-    user_id = msg.from_user.id if msg.from_user else None
+    count = 0
     async with SessionLocal() as db:
-        for unique, file_id, media_type in entries:
-            await _upsert_hash(
-                db,
-                key=unique,
-                file_id=file_id,
-                media_type=media_type,
-                user_id=user_id,
-                banned=True,
-            )
+        for media_message in messages:
+            user_id = media_message.from_user.id if media_message.from_user else None
+            for unique, file_id, media_type in media_file_entries(media_message):
+                await _upsert_hash(
+                    db,
+                    key=unique,
+                    file_id=file_id,
+                    media_type=media_type,
+                    user_id=user_id,
+                    banned=True,
+                )
+                count += 1
         await db.commit()
-    return len(entries)
+    return count
+
+
+async def _key_status(key: str | None) -> tuple[bool, bool]:
+    if not key:
+        return False, False
+    async with SessionLocal() as db:
+        result = await db.execute(
+            select(MediaHash.banned).where(MediaHash.file_unique_id == key)
+        )
+        values = list(result.scalars().all())
+    return bool(values), any(values)
+
+
+async def audit_hashes(bot: Bot, msg: Message) -> list[HashAuditEntry]:
+    """Calcule et vérifie les hashes du média ciblé ou de son album complet."""
+    entries: list[HashAuditEntry] = []
+    for media_message in related_media_messages(msg):
+        for unique, file_id, media_type in media_file_entries(media_message):
+            sha = await file_sha256(bot, file_id)
+            id_present, id_banned = await _key_status(unique)
+            sha_present, sha_banned = await _key_status(sha)
+            entries.append(
+                HashAuditEntry(
+                    media_type=media_type,
+                    file_unique_id=unique,
+                    sha256=sha,
+                    id_present=id_present,
+                    id_banned=id_banned,
+                    sha_present=sha_present,
+                    sha_banned=sha_banned,
+                )
+            )
+    return entries
+
+
+def format_hash_audit(entries: list[HashAuditEntry], *, title: str = "🔍 AUDIT HASH") -> str:
+    if not entries:
+        return f"{title}\n\n❌ Aucun média compatible trouvé."
+
+    blocks: list[str] = [title]
+    if len(entries) > 1:
+        blocks.append(f"\nAlbum détecté : {len(entries)} médias")
+
+    for index, entry in enumerate(entries, start=1):
+        blocks.append(
+            "\n────────────\n"
+            f"Média {index}/{len(entries)} — {entry.media_type}\n\n"
+            f"file_unique_id :\n{entry.file_unique_id}\n"
+            f"Présent en base : {'✅ OUI' if entry.id_present else '❌ NON'}\n"
+            f"Blacklist ID : {'✅ OUI' if entry.id_banned else '❌ NON'}\n\n"
+            f"SHA256 :\n{entry.sha256 or '⚠️ CALCUL IMPOSSIBLE'}\n"
+            f"Présent en base : {'✅ OUI' if entry.sha_present else '❌ NON'}\n"
+            f"Blacklist SHA : {'✅ OUI' if entry.sha_banned else '❌ NON'}"
+        )
+
+    fully_banned = sum(1 for entry in entries if entry.id_banned and entry.sha_banned)
+    partially_banned = sum(1 for entry in entries if entry.id_banned != entry.sha_banned)
+    if fully_banned == len(entries):
+        verdict = "🟢 Tous les médias sont blacklistés par ID et SHA256."
+    elif fully_banned or partially_banned:
+        verdict = "🟠 Blacklist partielle : au moins une empreinte manque."
+    else:
+        verdict = "🔴 Aucun média n'est totalement blacklisté."
+
+    blocks.append(
+        "\n────────────\n"
+        "Résumé\n\n"
+        f"Médias contrôlés : {len(entries)}\n"
+        f"Totalement blacklistés : {fully_banned}\n"
+        f"Partiellement blacklistés : {partially_banned}\n\n"
+        f"Verdict : {verdict}"
+    )
+    return "".join(blocks)
+
+
+def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
+    """Découpe sans dépasser la limite Telegram de 4096 caractères."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n────────────\n"):
+        candidate = block if not current else current + "\n────────────\n" + block
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = block
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 async def find_banned_hash(bot: Bot, msg: Message) -> HashBanMatch:
