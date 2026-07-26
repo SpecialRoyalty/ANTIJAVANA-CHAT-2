@@ -19,7 +19,7 @@ import asyncio
 from aiogram.exceptions import TelegramBadRequest
 from app.services.hashban import (
     audit_hashes,
-    ban_hash_from_message,
+    ensure_hashes_banned,
     banned_hash_count,
     format_hash_audit,
     hashban_health_text,
@@ -554,9 +554,9 @@ async def admin_text_state(msg:Message, bot:Bot):
         await msg.answer(await freepass_admin_text(), reply_markup=await free_pass_admin_kb_async())
     elif state=='hash_ban_media':
         remember_media_message(msg)
-        n=await ban_hash_from_message(msg, bot)
+        n, entries = await ensure_hashes_banned(bot, msg)
         if n:
-            entries=await audit_hashes(bot, msg)
+
             report=format_hash_audit(entries, title=f'✅ HASH BAN AJOUTÉ — {n} empreinte(s) enregistrée(s)')
             chunks=split_telegram_text(report)
             for index, chunk in enumerate(chunks):
