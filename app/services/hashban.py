@@ -14,10 +14,8 @@ from app.db.session import SessionLocal
 from app.services.state import log_error
 
 
-# Cache mémoire des albums reçus. Telegram envoie chaque élément d'un album comme
-# un Message séparé et ne fournit pas d'API pour relire les autres éléments.
-# Ce cache permet donc à /pedo et /hashdemande, lorsqu'ils répondent à un élément,
-# de traiter tout l'album tant que le processus n'a pas redémarré.
+# Telegram livre chaque élément d'un album dans une update séparée. Le cache permet
+# à /pedo et /hashdemande de traiter tout l'album reçu par le processus courant.
 _ALBUM_CACHE: dict[tuple[int, str], list[Message]] = {}
 _ALBUM_CACHE_AT: dict[tuple[int, str], float] = {}
 _ALBUM_TTL_SECONDS = 6 * 60 * 60
@@ -40,6 +38,12 @@ class HashAuditEntry:
     id_banned: bool
     sha_present: bool
     sha_banned: bool
+    message_id: int | None = None
+    media_group_id: str | None = None
+    file_size: int | None = None
+    duration: int | None = None
+    width: int | None = None
+    height: int | None = None
 
 
 def media_file_entries(msg: Message) -> list[tuple[str, str, str]]:
@@ -62,10 +66,27 @@ def media_file_entries(msg: Message) -> list[tuple[str, str, str]]:
     return []
 
 
+def _media_metadata(msg: Message) -> tuple[int | None, int | None, int | None, int | None]:
+    media = None
+    if msg.photo:
+        media = msg.photo[-1]
+    else:
+        media = msg.video or msg.document or msg.animation or msg.audio or msg.voice or msg.video_note
+    if media is None:
+        return None, None, None, None
+    return (
+        getattr(media, "file_size", None),
+        getattr(media, "duration", None),
+        getattr(media, "width", None),
+        getattr(media, "height", None),
+    )
+
+
 def remember_media_message(msg: Message) -> None:
-    """Mémorise un élément d'album afin de pouvoir auditer/bannir l'album complet."""
+    """Mémorise un élément d'album afin d'auditer/bannir l'album complet."""
     if not msg.media_group_id or not media_file_entries(msg):
         return
+
     now = time.monotonic()
     expired = [key for key, stored_at in _ALBUM_CACHE_AT.items() if now - stored_at > _ALBUM_TTL_SECONDS]
     for key in expired:
@@ -81,7 +102,7 @@ def remember_media_message(msg: Message) -> None:
 
 
 def related_media_messages(msg: Message) -> list[Message]:
-    """Retourne tout l'album connu, sinon seulement le message ciblé."""
+    """Retourne tout l'album connu, sinon seulement le média ciblé."""
     remember_media_message(msg)
     if not msg.media_group_id:
         return [msg] if media_file_entries(msg) else []
@@ -91,13 +112,19 @@ def related_media_messages(msg: Message) -> list[Message]:
 
 
 async def file_sha256(bot: Bot, file_id: str) -> str | None:
-    """Télécharge le fichier Telegram et retourne un SHA256 préfixé."""
+    """Télécharge le fichier Telegram et retourne son SHA256 binaire."""
     try:
         bio = await bot.download(file_id)
         if not bio:
             return None
         bio.seek(0)
-        return "sha256:" + hashlib.sha256(bio.read()).hexdigest()
+        digest = hashlib.sha256()
+        while True:
+            chunk = bio.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return "sha256:" + digest.hexdigest()
     except Exception as exc:
         await log_error("hashban_sha256", exc)
         return None
@@ -111,10 +138,16 @@ async def _upsert_hash(
     media_type: str,
     user_id: int | None,
     banned: bool,
-) -> None:
+) -> int:
+    """Crée ou met à jour toutes les lignes portant la clé.
+
+    Les anciennes versions n'avaient pas de contrainte UNIQUE et ont pu créer des
+    doublons. Utiliser scalar_one_or_none() faisait alors échouer /pedo. On met donc
+    toutes les lignes existantes à jour, ce qui répare aussi ces anciennes données.
+    """
     result = await db.execute(select(MediaHash).where(MediaHash.file_unique_id == key))
-    row = result.scalar_one_or_none()
-    if row is None:
+    rows = list(result.scalars().all())
+    if not rows:
         db.add(
             MediaHash(
                 user_id=user_id,
@@ -124,23 +157,25 @@ async def _upsert_hash(
                 banned=banned,
             )
         )
-        return
+        return 1
 
-    row.file_id = file_id
-    row.media_type = media_type
-    if user_id is not None:
-        row.user_id = user_id
-    if banned:
-        row.banned = True
+    for row in rows:
+        row.file_id = file_id
+        row.media_type = media_type
+        if user_id is not None:
+            row.user_id = user_id
+        if banned:
+            row.banned = True
+    return len(rows)
 
 
 async def store_message_hashes(msg: Message, bot: Bot, *, banned: bool = False) -> int:
-    """Enregistre file_unique_id ET SHA256 pour le média du message."""
+    """Enregistre l'ID Telegram et le SHA256 du média du message."""
     entries = media_file_entries(msg)
     if not entries:
         return 0
 
-    stored = 0
+    fingerprints = 0
     user_id = msg.from_user.id if msg.from_user else None
     async with SessionLocal() as db:
         for unique, file_id, media_type in entries:
@@ -152,7 +187,7 @@ async def store_message_hashes(msg: Message, bot: Bot, *, banned: bool = False) 
                 user_id=user_id,
                 banned=banned,
             )
-            stored += 1
+            fingerprints += 1
 
             sha = await file_sha256(bot, file_id)
             if sha:
@@ -164,13 +199,13 @@ async def store_message_hashes(msg: Message, bot: Bot, *, banned: bool = False) 
                     user_id=user_id,
                     banned=banned,
                 )
-                stored += 1
+                fingerprints += 1
         await db.commit()
-    return stored
+    return fingerprints
 
 
 async def ban_hash_from_message(msg: Message, bot: Bot | None = None) -> int:
-    """Blacklist le média ou tout son album par ID Telegram et par SHA256."""
+    """Blackliste le média ou tout l'album par ID Telegram et SHA256."""
     messages = related_media_messages(msg)
     if not messages:
         return 0
@@ -203,22 +238,21 @@ async def _key_status(key: str | None) -> tuple[bool, bool]:
     if not key:
         return False, False
     async with SessionLocal() as db:
-        result = await db.execute(
-            select(MediaHash.banned).where(MediaHash.file_unique_id == key)
-        )
+        result = await db.execute(select(MediaHash.banned).where(MediaHash.file_unique_id == key))
         values = list(result.scalars().all())
     return bool(values), any(values)
 
 
 async def audit_hashes(bot: Bot, msg: Message) -> list[HashAuditEntry]:
-    """Calcule et vérifie les hashes du média ciblé ou de son album complet."""
-    entries: list[HashAuditEntry] = []
+    """Calcule et vérifie les empreintes du média ciblé ou de son album."""
+    audits: list[HashAuditEntry] = []
     for media_message in related_media_messages(msg):
+        file_size, duration, width, height = _media_metadata(media_message)
         for unique, file_id, media_type in media_file_entries(media_message):
             sha = await file_sha256(bot, file_id)
             id_present, id_banned = await _key_status(unique)
             sha_present, sha_banned = await _key_status(sha)
-            entries.append(
+            audits.append(
                 HashAuditEntry(
                     media_type=media_type,
                     file_unique_id=unique,
@@ -227,9 +261,30 @@ async def audit_hashes(bot: Bot, msg: Message) -> list[HashAuditEntry]:
                     id_banned=id_banned,
                     sha_present=sha_present,
                     sha_banned=sha_banned,
+                    message_id=media_message.message_id,
+                    media_group_id=str(media_message.media_group_id) if media_message.media_group_id else None,
+                    file_size=file_size,
+                    duration=duration,
+                    width=width,
+                    height=height,
                 )
             )
-    return entries
+    return audits
+
+
+async def ensure_hashes_banned(bot: Bot, msg: Message) -> tuple[int, list[HashAuditEntry]]:
+    """Blackliste puis vérifie immédiatement que chaque empreinte est à banned=True.
+
+    Une seconde écriture ciblée est effectuée si une ancienne ligne dupliquée ou une
+    donnée incohérente est détectée. Le rapport retourné constitue la confirmation.
+    """
+    count = await ban_hash_from_message(msg, bot)
+    audits = await audit_hashes(bot, msg)
+    if audits and any(not item.id_banned or (item.sha256 is not None and not item.sha_banned) for item in audits):
+        # Réparation défensive des bases provenant d'anciennes versions.
+        count += await ban_hash_from_message(msg, bot)
+        audits = await audit_hashes(bot, msg)
+    return count, audits
 
 
 def format_hash_audit(entries: list[HashAuditEntry], *, title: str = "🔍 AUDIT HASH") -> str:
@@ -241,9 +296,21 @@ def format_hash_audit(entries: list[HashAuditEntry], *, title: str = "🔍 AUDIT
         blocks.append(f"\nAlbum détecté : {len(entries)} médias")
 
     for index, entry in enumerate(entries, start=1):
+        metadata = [f"message_id : {entry.message_id}"]
+        if entry.media_group_id:
+            metadata.append(f"media_group_id : {entry.media_group_id}")
+        if entry.file_size is not None:
+            metadata.append(f"taille : {entry.file_size} octets")
+        if entry.duration is not None:
+            metadata.append(f"durée : {entry.duration} s")
+        if entry.width is not None and entry.height is not None:
+            metadata.append(f"dimensions : {entry.width}×{entry.height}")
+
         blocks.append(
             "\n────────────\n"
-            f"Média {index}/{len(entries)} — {entry.media_type}\n\n"
+            f"Média {index}/{len(entries)} — {entry.media_type}\n"
+            + "\n".join(metadata)
+            + "\n\n"
             f"file_unique_id :\n{entry.file_unique_id}\n"
             f"Présent en base : {'✅ OUI' if entry.id_present else '❌ NON'}\n"
             f"Blacklist ID : {'✅ OUI' if entry.id_banned else '❌ NON'}\n\n"
@@ -252,14 +319,21 @@ def format_hash_audit(entries: list[HashAuditEntry], *, title: str = "🔍 AUDIT
             f"Blacklist SHA : {'✅ OUI' if entry.sha_banned else '❌ NON'}"
         )
 
-    fully_banned = sum(1 for entry in entries if entry.id_banned and entry.sha_banned)
-    partially_banned = sum(1 for entry in entries if entry.id_banned != entry.sha_banned)
+    fully_banned = sum(
+        1 for entry in entries if entry.id_banned and (entry.sha256 is None or entry.sha_banned)
+    )
+    partially_banned = sum(
+        1
+        for entry in entries
+        if (entry.id_banned or entry.sha_banned)
+        and not (entry.id_banned and (entry.sha256 is None or entry.sha_banned))
+    )
     if fully_banned == len(entries):
         verdict = "🟢 Tous les médias sont blacklistés par ID et SHA256."
     elif fully_banned or partially_banned:
         verdict = "🟠 Blacklist partielle : au moins une empreinte manque."
     else:
-        verdict = "🔴 Aucun média n'est totalement blacklisté."
+        verdict = "🔴 Aucun média n'est blacklisté."
 
     blocks.append(
         "\n────────────\n"
@@ -267,13 +341,15 @@ def format_hash_audit(entries: list[HashAuditEntry], *, title: str = "🔍 AUDIT
         f"Médias contrôlés : {len(entries)}\n"
         f"Totalement blacklistés : {fully_banned}\n"
         f"Partiellement blacklistés : {partially_banned}\n\n"
-        f"Verdict : {verdict}"
+        f"Verdict : {verdict}\n\n"
+        "ℹ️ Deux fichiers visuellement identiques peuvent avoir des SHA256 différents "
+        "si Telegram les réencode. Ce rapport vérifie les fichiers binaires réellement reçus."
     )
     return "".join(blocks)
 
 
 def split_telegram_text(text: str, limit: int = 3900) -> list[str]:
-    """Découpe sans dépasser la limite Telegram de 4096 caractères."""
+    """Découpe un rapport sans dépasser les 4096 caractères de Telegram."""
     if len(text) <= limit:
         return [text]
     chunks: list[str] = []
@@ -300,12 +376,11 @@ async def find_banned_hash(bot: Bot, msg: Message) -> HashBanMatch:
     async with SessionLocal() as db:
         for unique, _file_id, media_type in entries:
             result = await db.execute(
-                select(MediaHash.id).where(
-                    MediaHash.file_unique_id == unique,
-                    MediaHash.banned.is_(True),
-                )
+                select(MediaHash.id)
+                .where(MediaHash.file_unique_id == unique, MediaHash.banned.is_(True))
+                .limit(1)
             )
-            if result.scalar_one_or_none() is not None:
+            if result.first() is not None:
                 return HashBanMatch(True, "file_unique_id", unique, media_type)
 
     for _unique, file_id, media_type in entries:
@@ -314,12 +389,11 @@ async def find_banned_hash(bot: Bot, msg: Message) -> HashBanMatch:
             continue
         async with SessionLocal() as db:
             result = await db.execute(
-                select(MediaHash.id).where(
-                    MediaHash.file_unique_id == sha,
-                    MediaHash.banned.is_(True),
-                )
+                select(MediaHash.id)
+                .where(MediaHash.file_unique_id == sha, MediaHash.banned.is_(True))
+                .limit(1)
             )
-            if result.scalar_one_or_none() is not None:
+            if result.first() is not None:
                 return HashBanMatch(True, "sha256", sha, media_type)
 
     return HashBanMatch()
@@ -380,7 +454,7 @@ async def banned_hash_count() -> int:
 
 
 async def hashban_health_text() -> str:
-    """Indicateur basé uniquement sur de vrais reposts détectés."""
+    """Indicateur fondé uniquement sur de vrais reposts détectés."""
     from app.services import settings as st
 
     detected = int(await st.get_value("hashban_reposts_detected", "0") or "0")
@@ -396,7 +470,9 @@ async def hashban_health_text() -> str:
     else:
         state = "🟢 VÉRIFIÉ SUR REPOST RÉEL"
 
-    yes_no = lambda key: "✅" if key == "true" else "❌"
+    def yes_no(value: str) -> str:
+        return "✅" if value == "true" else "❌"
+
     return f"""🛡️ HASH-BAN
 
 État : {state}

@@ -110,8 +110,8 @@ async def record_media(msg: Message, bot: Bot | None = None, banned: bool = Fals
         async with SessionLocal() as db:
             for unique, file_id, media_type in entries:
                 result = await db.execute(select(MediaHash).where(MediaHash.file_unique_id == unique))
-                row = result.scalar_one_or_none()
-                if row is None:
+                rows = list(result.scalars().all())
+                if not rows:
                     db.add(MediaHash(
                         user_id=msg.from_user.id if msg.from_user else None,
                         file_unique_id=unique,
@@ -119,8 +119,12 @@ async def record_media(msg: Message, bot: Bot | None = None, banned: bool = Fals
                         media_type=media_type,
                         banned=banned,
                     ))
-                elif banned:
-                    row.banned = True
+                else:
+                    for row in rows:
+                        row.file_id = file_id
+                        row.media_type = media_type
+                        if banned:
+                            row.banned = True
             await db.commit()
         stored = len(entries)
     else:
