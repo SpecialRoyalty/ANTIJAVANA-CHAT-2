@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime, timedelta
 
 from aiogram import Bot
@@ -48,9 +49,37 @@ async def words(kind: str) -> list[str]:
         return [row.word.lower() for row in result.scalars().all()]
 
 
+def _word_tokens(value: str) -> list[str]:
+    """Normalise puis découpe un texte en mots complets.
+
+    Les espaces, tirets, points, underscores et caractères spéciaux sont
+    considérés comme des séparateurs. Ainsi, la règle ``cp`` correspond à
+    ``je_cp_quoi`` mais pas à ``jecpquoi``.
+    """
+    normalized = unicodedata.normalize("NFKC", value or "").casefold()
+    return re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+
+
+def _contains_complete_rule(rule: str, tokens: list[str]) -> bool:
+    """Recherche une règle composée d'un ou plusieurs mots entiers consécutifs."""
+    rule_tokens = _word_tokens(rule)
+    if not rule_tokens or len(rule_tokens) > len(tokens):
+        return False
+
+    size = len(rule_tokens)
+    return any(
+        tokens[index:index + size] == rule_tokens
+        for index in range(len(tokens) - size + 1)
+    )
+
+
 async def text_has_word(kind: str, text: str) -> bool:
-    lowered = (text or "").lower()
-    return any(word and word in lowered for word in await words(kind))
+    """Vérifie les règles ``ban`` et ``forbidden`` par mots complets uniquement."""
+    tokens = _word_tokens(text)
+    return any(
+        _contains_complete_rule(rule, tokens)
+        for rule in await words(kind)
+    )
 
 
 async def restrict(bot: Bot, chat_id: int, user_id: int, days: int) -> bool:

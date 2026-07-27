@@ -1,17 +1,48 @@
 from datetime import datetime, timedelta
 import json
+import re
+import unicodedata
 from sqlalchemy import select
 from aiogram import Bot
 from aiogram.types import ChatMemberUpdated, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from app.db.session import SessionLocal
 from app.db.models import User, InviteLink
-from app.services.users import upsert_user
+from app.services.users import upsert_user, protected
 from app.config import get_settings
-from app.services.moderation import text_has_word
+from app.services.moderation import words
 from app.services.state import log_error, track
 from app.services import settings as st
 
 JOIN_CACHE: dict[int, tuple[int|None, datetime]] = {}
+
+
+def _name_tokens(value: str) -> list[str]:
+    """Normalise un nom puis le découpe en mots distincts.
+
+    Les espaces, tirets, points, underscores et caractères spéciaux sont
+    considérés comme des séparateurs. Une règle courte comme ``cp`` ne
+    correspond donc pas à ``jecpquoi``, mais correspond à ``je_cp_quoi``.
+    """
+    normalized = unicodedata.normalize("NFKC", value or "").casefold()
+    return re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+
+
+def _contains_name_rule(rule: str, tokens: list[str]) -> bool:
+    """Recherche une règle sous forme de mot ou de suite de mots entiers."""
+    rule_tokens = _name_tokens(rule)
+    if not rule_tokens or len(rule_tokens) > len(tokens):
+        return False
+    size = len(rule_tokens)
+    return any(tokens[index:index + size] == rule_tokens for index in range(len(tokens) - size + 1))
+
+
+async def matches_nameban(username: str | None, full_name: str | None) -> tuple[bool, str | None]:
+    """Retourne la règle nameban trouvée, sans recherche par sous-chaîne."""
+    tokens = _name_tokens(f"{username or ''} {full_name or ''}")
+    for rule in await words("nameban"):
+        if _contains_name_rule(rule, tokens):
+            return True, rule
+    return False, None
 
 DEFAULT_TIERS=[
     {"count":1,"label":"1 vidéo","link":""},
@@ -94,12 +125,20 @@ async def send_invite_private(bot:Bot, user_id:int):
 async def on_join(event:ChatMemberUpdated, bot:Bot|None=None):
     if not event.new_chat_member or event.new_chat_member.status not in ('member','restricted'): return
     u=await upsert_user(event.from_user)
-    name=((event.from_user.username or '')+' '+(event.from_user.full_name or '')).strip()
-    if bot and await text_has_word('nameban', name):
+    name_banned, matched_rule = await matches_nameban(
+        event.from_user.username,
+        event.from_user.full_name,
+    )
+    if bot and name_banned and not await protected(event.from_user.id):
         try:
             await bot.ban_chat_member(event.chat.id, event.from_user.id)
-            u.is_banned=True
-        except Exception as e: await log_error('nameban_join', e)
+            async with SessionLocal() as db:
+                stored_user = await db.get(User, event.from_user.id)
+                if stored_user:
+                    stored_user.is_banned = True
+                    await db.commit()
+        except Exception as e:
+            await log_error(f'nameban_join:{matched_rule or "unknown"}', e)
         return
     owner=None
     inv=getattr(event,'invite_link',None)
