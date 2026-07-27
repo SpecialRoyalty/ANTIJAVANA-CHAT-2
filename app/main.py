@@ -14,6 +14,7 @@ from app.scheduler import start_scheduler
 from app.services import settings as st
 from app.services.settings import init_defaults
 from app.services.state import cleanup_known_status_duplicates, ensure_status_message
+from app.services.telegram_client import ResilientBot
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,12 @@ async def main() -> None:
 
     settings = get_settings()
     scheduler = None
-    bot = Bot(settings.bot_token)
+    bot = ResilientBot(
+        settings.bot_token,
+        max_concurrent_requests=4,
+        min_request_interval=0.08,
+        max_retries=5,
+    )
 
     try:
         await init_db()
