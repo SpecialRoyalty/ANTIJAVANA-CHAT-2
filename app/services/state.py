@@ -1,7 +1,8 @@
+import asyncio
 import logging
 from sqlalchemy import select, func
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramServerError
 from app.config import get_settings
 from app.db.session import SessionLocal
 from app.db.models import Vote, TrackedMessage, ErrorLog
@@ -65,13 +66,11 @@ async def track(chat_id:int,message_id:int,user_id:int|None,kind='message',is_me
         await db.commit()
 
 async def ensure_status_message(bot:Bot, chat_id:int, recreate_on_change:bool=False):
-    """Maintient le message principal.
+    """Maintient le message principal sans créer de doublon en cas de panne API.
 
-    - Par défaut: édite le message existant, utile pour les votes instantanés.
-    - recreate_on_change=True: si le texte a changé depuis la dernière version,
-      supprime l'ancien message et en publie un nouveau. C'est utilisé par le
-      scheduler aux paliers de compte à rebours pour que l'heure Telegram visible
-      du message change vraiment.
+    Une erreur réseau pendant une édition ne signifie pas que le message a
+    disparu. Dans ce cas on laisse le scheduler réessayer plus tard au lieu de
+    publier immédiatement un nouveau message d'état.
     """
     text=await status_text(chat_id)
     mid=await st.get_value('status_message_id','')
@@ -86,9 +85,20 @@ async def ensure_status_message(bot:Bot, chat_id:int, recreate_on_change:bool=Fa
                 tm=res.scalar_one_or_none()
                 if tm: tm.deleted=True
                 await db.commit()
+            mid=''
+        except TelegramBadRequest as e:
+            low=str(e).lower()
+            if 'message to delete not found' in low or 'message identifier is not specified' in low:
+                mid=''
+            else:
+                await log_error('delete_old_status',e)
+                raise
+        except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError) as e:
+            await log_error('delete_old_status_temporary',e)
+            raise
         except Exception as e:
             await log_error('delete_old_status',e)
-        mid=''
+            raise
 
     if mid:
         try:
@@ -101,10 +111,17 @@ async def ensure_status_message(bot:Bot, chat_id:int, recreate_on_change:bool=Fa
             low=str(e).lower()
             if 'message is not modified' in low:
                 return int(mid)
-            if 'message to edit not found' not in low:
+            if 'message to edit not found' in low:
+                mid=''
+            else:
                 await log_error('edit_status',e)
+                raise
+        except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError) as e:
+            await log_error('edit_status_temporary',e)
+            raise
         except Exception as e:
             await log_error('edit_status',e)
+            raise
 
     m=await bot.send_message(chat_id,text,reply_markup=kb)
     await st.set_value('status_message_id',str(m.message_id))
