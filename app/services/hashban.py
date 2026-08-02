@@ -176,21 +176,49 @@ def _ffmpeg_executable() -> str:
 
 
 def _video_frame_hashes(path: str, duration: int | None) -> list[str]:
-    interval = max(4, int((duration or 30) / 6))
+    """Extrait plusieurs images représentatives, y compris pour les clips très courts.
+
+    L'ancienne stratégie utilisait une image toutes les quatre secondes au minimum.
+    Une vidéo d'une seconde ne produisait donc souvent qu'une seule image, tandis que
+    le fingerprint exigeait au moins deux hashes. Pour les clips de deux secondes ou
+    moins, on échantillonne désormais à 4 images/seconde. Si FFmpeg ne fournit malgré
+    tout qu'une seule image (clip fixe ou fichier atypique), cette image est dupliquée
+    afin de conserver un fingerprint exploitable et comparable.
+    """
+    short_clip = duration is not None and duration <= 2
     with tempfile.TemporaryDirectory(prefix="hashban_frames_") as directory:
         output = str(Path(directory) / "frame_%02d.jpg")
+        if short_clip:
+            video_filter = "fps=4,scale=192:-2"
+            max_frames = "8"
+        else:
+            interval = max(1, int((duration or 30) / 6))
+            video_filter = f"fps=1/{interval},scale=192:-2"
+            max_frames = "8"
+
         command = [
             _ffmpeg_executable(), "-hide_banner", "-loglevel", "error", "-i", path,
-            "-vf", f"fps=1/{interval},scale=192:-2", "-frames:v", "8", "-q:v", "3", output,
+            "-vf", video_filter, "-frames:v", max_frames, "-q:v", "3", output,
         ]
-        subprocess.run(command, check=True, timeout=90, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(
+            command,
+            check=True,
+            timeout=90,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         frames = sorted(Path(directory).glob("frame_*.jpg"))
-        return [_dhash(str(frame)) for frame in frames]
+        hashes = [_dhash(str(frame)) for frame in frames]
+        if len(hashes) == 1:
+            hashes.append(hashes[0])
+        return hashes
 
 
 def _fingerprint_key(frame_hashes: list[str]) -> str | None:
-    if len(frame_hashes) < 2:
+    if not frame_hashes:
         return None
+    if len(frame_hashes) == 1:
+        frame_hashes = [frame_hashes[0], frame_hashes[0]]
     return "vphash:" + ",".join(frame_hashes)
 
 
