@@ -28,6 +28,8 @@ from app.services.hashban import (
 )
 from app.services.freepass import free_pass_admin_kb, free_pass_admin_kb_async, admin_text as freepass_admin_text, publish_free_pass, beneficiaries_text as freepass_beneficiaries_text, reset_current_session as freepass_reset_current, reserve_free_pass, refresh_free_pass_message, is_locked as freepass_is_locked, in_admin_config_window as freepass_window_open, delete_free_pass_campaign
 from app.services.broadcast import register_private_start, supported_broadcast_message, broadcast_to_main_group, broadcast_to_private_starters, private_subscriber_count
+from app.services.anti_fast_join import health_text as fast_join_health_text
+from app.services.anti_repost import health_text as anti_repost_health_text
 router=Router()
 
 def is_admin(uid:int): return uid in get_settings().admin_ids
@@ -50,6 +52,60 @@ def justice_settings_kb(limit:int):
         [InlineKeyboardButton(text='10', callback_data='justice_limit_set:10'), InlineKeyboardButton(text='20', callback_data='justice_limit_set:20'), InlineKeyboardButton(text='30', callback_data='justice_limit_set:30'), InlineKeyboardButton(text='50', callback_data='justice_limit_set:50')],
         [InlineKeyboardButton(text='⬅️ Retour paramètres', callback_data='adm_settings')]
     ])
+
+
+async def fast_join_settings_text():
+    is_enabled = (await st.get_value('anti_fast_join_enabled','true')) == 'true'
+    minutes = int(await st.get_value('anti_fast_join_minutes','5') or '5')
+    state = 'ON' if is_enabled else 'OFF'
+    return f'''🛡️ Anti publication immédiate
+
+Statut : {state}
+Délai : {minutes} minute(s)
+
+Si un membre dont l’arrivée vient d’être observée publie un média avant la fin de ce délai :
+• ban immédiat
+• suppression de tous ses messages/médias suivis
+• aucun traitement/copie VIP après la sanction
+
+Admins et trusted : jamais concernés.
+Si l’heure d’arrivée n’est pas connue : aucune sanction automatique.'''
+
+
+def fast_join_settings_kb(is_enabled: bool, minutes: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=('⛔ Désactiver' if is_enabled else '✅ Activer'), callback_data='fast_join_toggle')],
+        [InlineKeyboardButton(text='1 min', callback_data='fast_join_minutes:1'), InlineKeyboardButton(text='3 min', callback_data='fast_join_minutes:3'), InlineKeyboardButton(text='5 min', callback_data='fast_join_minutes:5')],
+        [InlineKeyboardButton(text='10 min', callback_data='fast_join_minutes:10'), InlineKeyboardButton(text='15 min', callback_data='fast_join_minutes:15')],
+        [InlineKeyboardButton(text=f'Délai actuel : {minutes} min', callback_data='noop')],
+        [InlineKeyboardButton(text='🩺 Vérifier', callback_data='fast_join_health')],
+        [InlineKeyboardButton(text='⬅️ Retour paramètres', callback_data='adm_settings')],
+    ])
+
+
+async def anti_repost_settings_text():
+    is_enabled = (await st.get_value('anti_repost_enabled','false')) == 'true'
+    return f'''♻️ Anti repost
+
+Statut : {'ON' if is_enabled else 'OFF'}
+
+Quand cette option est active, un média déjà envoyé dans le groupe principal ne peut pas être reposté.
+
+Détection exacte :
+• file_unique_id Telegram
+• SHA256 du fichier
+
+En cas de repost : média/album supprimé, avertissement temporaire, aucune copie VIP.
+Aucun ban automatique. Admins et trusted ne sont pas concernés.'''
+
+
+def anti_repost_settings_kb(is_enabled: bool):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=('⛔ Désactiver' if is_enabled else '✅ Activer'), callback_data='anti_repost_toggle')],
+        [InlineKeyboardButton(text='🩺 Vérifier', callback_data='anti_repost_health')],
+        [InlineKeyboardButton(text='⬅️ Retour paramètres', callback_data='adm_settings')],
+    ])
+
 async def set_admin_state(uid:int,state:str): await st.set_value(f'admin_state:{uid}',state)
 async def get_admin_state(uid:int): return await st.get_value(f'admin_state:{uid}','')
 async def clear_admin_state(uid:int): await st.set_value(f'admin_state:{uid}','')
@@ -120,7 +176,7 @@ async def admin_cb(cb:CallbackQuery, bot:Bot):
         count=await private_subscriber_count()
         await set_admin_state(cb.from_user.id, 'broadcast_private')
         await cb.message.answer(f'📨 Broadcast privé\n\nDestinataires actifs : {count}\n\nEnvoie maintenant :\n• un texte\n• une photo\n• une photo avec légende\n\nLe message sera envoyé immédiatement aux personnes ayant fait /start en privé.')
-    elif d=='adm_settings': await cb.message.answer('⚙️ Paramètres\nHoraires + limite justice populaire.',reply_markup=settings_kb())
+    elif d=='adm_settings': await cb.message.answer('⚙️ Paramètres\nHoraires + limite justice populaire + anti publication immédiate.',reply_markup=settings_kb())
     await cb.answer()
 
 @router.callback_query(F.data.startswith('goal_set:'))
@@ -629,6 +685,85 @@ async def cb_justice_run(cb:CallbackQuery, bot:Bot):
             await cb.message.answer(txt, reply_markup=kb)
         await cb.answer()
 
+
+
+
+
+@router.callback_query(F.data=='settings_fast_join')
+async def cb_settings_fast_join(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    is_enabled=(await st.get_value('anti_fast_join_enabled','true'))=='true'
+    minutes=int(await st.get_value('anti_fast_join_minutes','5') or '5')
+    await cb.message.answer(await fast_join_settings_text(), reply_markup=fast_join_settings_kb(is_enabled, minutes))
+    await cb.answer()
+
+
+@router.callback_query(F.data=='fast_join_toggle')
+async def cb_fast_join_toggle(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    current=(await st.get_value('anti_fast_join_enabled','true'))=='true'
+    is_enabled=not current
+    await st.set_value('anti_fast_join_enabled','true' if is_enabled else 'false')
+    minutes=int(await st.get_value('anti_fast_join_minutes','5') or '5')
+    try:
+        await cb.message.edit_text(await fast_join_settings_text(), reply_markup=fast_join_settings_kb(is_enabled, minutes))
+    except Exception:
+        await cb.message.answer(await fast_join_settings_text(), reply_markup=fast_join_settings_kb(is_enabled, minutes))
+    await cb.answer('Anti publication immédiate : '+('ON' if is_enabled else 'OFF'))
+
+
+@router.callback_query(F.data.startswith('fast_join_minutes:'))
+async def cb_fast_join_minutes(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    minutes=max(1,min(int(cb.data.split(':',1)[1]),60))
+    await st.set_value('anti_fast_join_minutes',str(minutes))
+    is_enabled=(await st.get_value('anti_fast_join_enabled','true'))=='true'
+    try:
+        await cb.message.edit_text(await fast_join_settings_text(), reply_markup=fast_join_settings_kb(is_enabled, minutes))
+    except Exception:
+        await cb.message.answer(await fast_join_settings_text(), reply_markup=fast_join_settings_kb(is_enabled, minutes))
+    await cb.answer(f'Délai : {minutes} min')
+
+
+@router.callback_query(F.data=='fast_join_health')
+async def cb_fast_join_health(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    await cb.message.answer(await fast_join_health_text())
+    await cb.answer()
+
+@router.callback_query(F.data=='settings_anti_repost')
+async def cb_settings_anti_repost(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    is_enabled=(await st.get_value('anti_repost_enabled','false'))=='true'
+    await cb.message.answer(await anti_repost_settings_text(), reply_markup=anti_repost_settings_kb(is_enabled))
+    await cb.answer()
+
+
+@router.callback_query(F.data=='anti_repost_toggle')
+async def cb_anti_repost_toggle(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    current=(await st.get_value('anti_repost_enabled','false'))=='true'
+    is_enabled=not current
+    await st.set_value('anti_repost_enabled','true' if is_enabled else 'false')
+    try:
+        await cb.message.edit_text(await anti_repost_settings_text(), reply_markup=anti_repost_settings_kb(is_enabled))
+    except Exception:
+        await cb.message.answer(await anti_repost_settings_text(), reply_markup=anti_repost_settings_kb(is_enabled))
+    await cb.answer('Anti repost : '+('ON' if is_enabled else 'OFF'))
+
+
+@router.callback_query(F.data=='anti_repost_health')
+async def cb_anti_repost_health(cb:CallbackQuery):
+    if not cb.from_user or not is_admin(cb.from_user.id):
+        return
+    await cb.message.answer(await anti_repost_health_text())
+    await cb.answer()
 
 
 @router.callback_query(F.data=='settings_justice')

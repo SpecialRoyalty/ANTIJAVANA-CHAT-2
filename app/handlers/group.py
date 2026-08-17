@@ -11,6 +11,7 @@ from app.services.hashban import remember_media_message
 from app.services.state import track
 from app.services.users import upsert_user
 from app.services.vip import copy_media_to_vip, handle_vip_proof
+from app.services.anti_fast_join import register_join
 
 router = Router()
 
@@ -46,6 +47,7 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot):
 
 @router.chat_member()
 async def member_update(event: ChatMemberUpdated, bot: Bot):
+    await register_join(event)
     await on_join(event, bot)
 
 
