@@ -20,6 +20,8 @@ from app.services.hashban import (
 )
 from app.services.state import log_error, track
 from app.services.users import display_name, protected
+from app.services.anti_fast_join import enforce as enforce_fast_join
+from app.services.anti_repost import enforce as enforce_anti_repost
 
 
 def has_link(text: str) -> bool:
@@ -192,6 +194,13 @@ async def moderate_message(bot: Bot, msg: Message) -> bool:
         await delete(bot, msg)
         return False
 
+    # Anti-retour / publication immédiate : un membre dont l'arrivée a été
+    # réellement observée et qui poste un média pendant la fenêtre configurée
+    # est banni et tous ses contenus suivis sont supprimés.
+    if is_media(msg) and not (trusted or admin):
+        if await enforce_fast_join(bot, msg):
+            return False
+
     if is_media(msg):
         match = await find_banned_hash(bot, msg)
         if match.matched:
@@ -207,6 +216,13 @@ async def moderate_message(bot: Bot, msg: Message) -> bool:
                 message_id=msg.message_id,
             )
             return False
+
+        # Anti-repost configurable : si le média exact a déjà été envoyé,
+        # suppression silencieuse du média/album + avertissement temporaire.
+        # Le contrôle a lieu AVANT record_media pour éviter l'auto-détection.
+        if not (trusted or admin) and await enforce_anti_repost(bot, msg):
+            return False
+
         await record_media(msg, bot=bot)
 
     # Liens interdits pour tout le monde sauf admins ; trusted supprimé sans sanction.
