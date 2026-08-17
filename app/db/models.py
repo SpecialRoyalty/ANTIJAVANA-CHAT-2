@@ -189,6 +189,15 @@ class FreePassReservation(Base):
     created_at: Mapped[datetime]=mapped_column(DateTime, default=datetime.utcnow)
     __table_args__=(UniqueConstraint('user_id','session_key', name='uq_free_pass_user_session'),)
 
+
+class RapidJoinGuard(Base):
+    __tablename__ = 'rapid_join_guards'
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    last_triggered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    trigger_count: Mapped[int] = mapped_column(Integer, default=0)
+
 class VideoFingerprint(Base):
     __tablename__ = 'video_fingerprints'
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
