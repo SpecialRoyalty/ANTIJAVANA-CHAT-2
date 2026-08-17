@@ -37,6 +37,8 @@ def settings_kb():
         [InlineKeyboardButton(text='22h00 → 00h00',callback_data='slot_set:22:00-00:00')],
         [InlineKeyboardButton(text='23h00 → 01h00',callback_data='slot_set:23:00-01:00')],
         [InlineKeyboardButton(text='⚖️ Limite justice populaire',callback_data='settings_justice')],
+        [InlineKeyboardButton(text='🛡️ Anti publication immédiate',callback_data='settings_fast_join')],
+        [InlineKeyboardButton(text='♻️ Anti repost',callback_data='settings_anti_repost')],
         [InlineKeyboardButton(text='⬅️ Retour',callback_data='adm_dashboard')]
     ])
 
